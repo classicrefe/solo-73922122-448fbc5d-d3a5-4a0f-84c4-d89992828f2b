@@ -74,12 +74,14 @@
   <label class="muted" style="color:#9fb3c8">目录</label>
   <select id="catalogSelect"></select>
   <span class="ver" id="verBadge">v-</span>
+  <span class="ver" id="kindBadge" style="display:none" title="由“加载演示数据”创建，重置只影响本目录">专用演示目录</span>
   <button class="ghost" id="btnNewCatalog">新建目录</button>
   <button id="btnDemo">加载演示数据</button>
 </header>
 <main>
   <section>
-    <h2>① 遥测分区目录 <span class="hint">同一目录快照：每次上传/变更都会递增版本并使旧核查失效（时间均为 UTC）</span></h2>
+    <h2>① 遥测分区目录 <span class="hint">同一目录快照：每次上传/变更都会递增版本并使旧核查失效（时间均为 UTC）</span>
+      <span class="hint" id="catalogKindHint"></span></h2>
     <details class="upload">
       <summary>上传分区批次（JSON 数组：partition_hour / planned_deadline / submitted_at / revision）</summary>
       <textarea id="uploadJson" placeholder='[{"partition_hour":"2026-11-20T00:00:00Z","planned_deadline":"2026-11-20T01:00:00Z","submitted_at":"2026-11-20T00:55:00Z","revision":1}]'></textarea>
@@ -170,15 +172,20 @@ function fmt(s) {
 }
 function badge(cls, text) { return `<span class="badge b-${cls}">${text}</span>`; }
 
+function catalogLabel(c) {
+  return `${c.name} (#${c.id})${c.is_demo ? " · 专用演示" : ""}`;
+}
+
 // ---------- 目录 ----------
 async function loadCatalogs(selectId) {
   const { catalogs } = await api("/api/catalogs");
   const sel = $("catalogSelect");
-  sel.innerHTML = catalogs.map(c => `<option value="${c.id}">${c.name} (#${c.id})</option>`).join("");
+  sel.innerHTML = catalogs.map(c => `<option value="${c.id}">${catalogLabel(c)}</option>`).join("");
   if (!catalogs.length) { currentCatalog = null; renderAll(); return; }
   const id = selectId || currentCatalog?.id || catalogs[0].id;
   sel.value = id;
   currentCatalog = catalogs.find(c => c.id == id) || catalogs[0];
+  sel.value = currentCatalog.id;
   renderAll();
 }
 
@@ -186,10 +193,25 @@ async function refreshCatalog() {
   if (!currentCatalog) return;
   currentCatalog = await api(`/api/catalogs/${currentCatalog.id}`);
   $("verBadge").textContent = "v" + currentCatalog.version;
+  renderKind();
+}
+
+function renderKind() {
+  const demo = !!(currentCatalog && currentCatalog.is_demo);
+  $("kindBadge").style.display = demo ? "inline-block" : "none";
+  const hint = $("catalogKindHint");
+  if (hint) hint.textContent = currentCatalog
+    ? (demo ? "当前为专用演示目录：加载演示数据只重置此目录"
+            : "当前为普通目录：加载演示数据不会改动此目录")
+    : "";
+  const sel = $("catalogSelect");
+  const opt = sel.options[sel.selectedIndex];
+  if (opt && currentCatalog) opt.textContent = catalogLabel(currentCatalog);
 }
 
 function renderAll() {
   $("verBadge").textContent = currentCatalog ? "v" + currentCatalog.version : "v-";
+  renderKind();
   loadPartitions(); loadReports(); loadChecks();
 }
 
@@ -369,8 +391,10 @@ $("btnDemo").addEventListener("click", async () => {
     const asOf = new Date(d.as_of);
     $("checkAsOf").value = new Date(asOf.getTime() - asOf.getTimezoneOffset() * 60000)
       .toISOString().slice(0, 16);
+    // 加载后立即按当前快照核查，结果卡片可直接查看。
     await runCheck();
-    toast("演示数据已加载并完成核查", "ok");
+    toast(d.created ? "已创建专用演示目录并完成核查"
+                    : "已重置专用演示目录并完成核查", "ok");
   } catch (e) { toast(e.message, "err"); }
 });
 

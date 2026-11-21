@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/freshness.db
+    DB_PATH=/data/freshness.db \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 

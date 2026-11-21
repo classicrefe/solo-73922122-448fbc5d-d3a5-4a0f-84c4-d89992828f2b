@@ -14,7 +14,11 @@ docker compose up --build
 # 打开 http://localhost:8000
 ```
 
-SQLite 数据持久化在命名卷 `freshness-data` 中（容器内 `/data/freshness.db`）。
+SQLite 数据持久化在命名卷 `freshness-data` 中（容器内 `/data/freshness.db`），
+并带有健康检查；`docker compose ps` 显示健康后即可访问。
+
+> 想验证旧库升级时，可把旧库文件复制进命名卷后再启动，例如：
+> `docker compose run --rm -v "$PWD/data:/seed:ro" web cp /seed/freshness.db /data/freshness.db`。
 
 ### 本地开发
 
@@ -25,8 +29,10 @@ uvicorn app.main:app --reload --port 8000
 
 ## 使用流程
 
-1. 点击 **加载演示数据**：生成“演示目录”（含跨日、迟到、重复提交、修订替代、
-   缺失、截至前未提交等场景）并自动运行一次核查；
+1. 点击 **加载演示数据**：确保存在唯一的**专用演示目录**（`is_demo` 标记），
+   在其中重建“演示目录”（含跨日、迟到、重复提交、修订替代、缺失、截至前未提交等
+   场景）并自动运行一次核查。该按钮**只重置专用演示目录**，绝不会改动用户自建的
+   普通目录——即使普通目录也叫“演示目录”；页头徽标与目录下拉会区分两者；
 2. 或自行 **新建目录** → 上传分区 JSON → 添加日报依赖（偏移天数 + 宽限分钟）
    → 选择业务日期与截至时刻 → **运行核查**；
 3. 结果卡片展示每个日报的就绪/阻断状态、安全水位、最早阻断原因与逐小时明细；
@@ -42,6 +48,17 @@ uvicorn app.main:app --reload --port 8000
    "revision": 1}
 ]
 ```
+
+### 演示目录语义
+
+- 分区与日报依赖在**同一个事务**内一起更新（先删后插，版本 +1）；任何一步失败
+  整体回滚：已有演示数据保持上一次的完整状态，首次失败则不会留下空目录；
+- 并发首次加载（多个浏览器 / 多个进程）通过 `BEGIN IMMEDIATE` 写锁串行化，
+  配合 `catalogs(is_demo) WHERE is_demo = 1` 的部分唯一索引，全库只会有一个
+  专用演示目录；重启后继续复用；
+- 升级已有 SQLite 库时只新增 `is_demo` 列与索引；旧库里名为“演示目录”的目录
+  无法确认来源，因此**一律保留为普通目录**，其分区、日报依赖与核查记录原样保留。
+  新专用目录随后单独创建，二者同名但可区分。
 
 ## 判定语义
 
@@ -63,7 +80,12 @@ python -m pytest tests/ -v
 ```
 
 覆盖：跨日窗口（offset=1/2）、超宽限/宽限内迟到、重复修订阻断、修订替代不阻断、
-缺失、截至前未提交、目录更新后旧核查失效、演示数据故事线、输入校验。
+缺失、截至前未提交、目录更新后旧核查失效、演示数据故事线、输入校验；以及
+演示目录隔离（同名普通目录不受影响）、旧库升级保留、并发首次加载、失败回滚与
+数据库唯一约束。
+
+> 测试通过 `tests/conftest.py` 把默认 `DB_PATH` 指向临时文件，仓库自带的
+> `data/freshness.db` 不会被就地迁移。
 
 ## API 概览
 
@@ -78,6 +100,6 @@ python -m pytest tests/ -v
 | POST | `/api/catalogs/{id}/checks` | 运行核查（业务日期 + 截至时刻） |
 | GET | `/api/catalogs/{id}/checks` | 核查历史（含 stale 标记） |
 | GET | `/api/checks/{check_id}` | 核查详情（逐小时明细） |
-| POST | `/api/demo` | 创建/重置演示目录 |
+| POST | `/api/demo` | 创建/重置**专用演示目录**（返回 `catalog_id`、`is_demo`、`created`、核查参数） |
 
 交互式 API 文档：`http://localhost:8000/docs`

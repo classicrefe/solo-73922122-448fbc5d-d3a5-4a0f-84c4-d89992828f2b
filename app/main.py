@@ -293,34 +293,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/demo", status_code=201)
     def load_demo(conn=Depends(get_db)):
-        """创建/重置演示目录，覆盖：跨日依赖、宽限内/超宽限迟到、重复提交、
-        修订替代、分区缺失、截至前未提交 等场景。"""
-        name = "演示目录"
-        row = conn.execute("SELECT * FROM catalogs WHERE name = ?", (name,)).fetchone()
-        if row is None:
-            cur = conn.execute(
-                "INSERT INTO catalogs(name, version, created_at) VALUES (?, 0, ?)",
-                (name, logic.iso(logic.now())))
-            catalog_id = cur.lastrowid
-        else:
-            catalog_id = row["id"]
-        conn.execute("DELETE FROM partitions WHERE catalog_id = ?", (catalog_id,))
-        conn.execute("DELETE FROM reports WHERE catalog_id = ?", (catalog_id,))
+        """创建/重置**专用演示目录**，覆盖：跨日依赖、宽限内/超宽限迟到、重复提交、
+        修订替代、分区缺失、截至前未提交 等场景。
 
-        now_iso = logic.iso(logic.now())
-        today = logic.now().date()
+        约定：
+          - 只操作 catalogs.is_demo = 1 的目录；用户自建的普通目录即使同名也绝不改动；
+          - 旧库迁移时无法确认身份的旧“演示目录”保持普通目录身份（见 db._migrate）；
+          - BEGIN IMMEDIATE 串行化首次创建：并发请求只会得到一个专用演示目录；
+          - 分区与日报依赖在同一事务内先删后插，任何一步失败都回滚，
+            已有演示数据保持上一次的完整状态，首次失败也不会留下空目录。
+        """
+        now = logic.now()
+        now_iso = logic.iso(now)
+        today = now.date()
         d1 = today - timedelta(days=1)
         d2 = today - timedelta(days=2)
 
         def mk(day: date, hour: int, deadline_min: int, submitted_min: int, rev: int):
             start = datetime(day.year, day.month, day.day, tzinfo=logic.UTC)
             h = start + timedelta(hours=hour)
-            return (catalog_id, logic.iso(h),
+            return (logic.iso(h),
                     logic.iso(h + timedelta(minutes=deadline_min)),
                     logic.iso(h + timedelta(minutes=submitted_min)),
                     rev, now_iso)
 
-        rows = []
+        # 先在内存中生成完整数据集，catalog_id 在事务内确定后再补上。
+        rows: list[tuple] = []
         # 前天：24 个分区全部准时（供 offset=2 的日报 READY）
         for h in range(24):
             rows.append(mk(d2, h, 60, 55, 1))
@@ -341,27 +339,55 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 sub = datetime(today.year, today.month, today.day, 10, tzinfo=logic.UTC)
                 start = datetime(d1.year, d1.month, d1.day, tzinfo=logic.UTC)
                 h22 = start + timedelta(hours=22)
-                rows.append((catalog_id, logic.iso(h22),
+                rows.append((logic.iso(h22),
                              logic.iso(h22 + timedelta(minutes=60)),
                              logic.iso(sub), 1, now_iso))
             else:
                 rows.append(mk(d1, h, 60, 55, 1))
-        conn.executemany(
-            "INSERT INTO partitions(catalog_id, partition_hour, planned_deadline,"
-            " submitted_at, revision, created_at) VALUES (?,?,?,?,?,?)", rows)
 
         reports = [("运营日报", 1, 60), ("设备日报", 1, 30), ("前日回顾报", 2, 30)]
-        conn.executemany(
-            "INSERT INTO reports(catalog_id, name, offset_days, grace_minutes, created_at)"
-            " VALUES (?,?,?,?,?)",
-            [(catalog_id, n, o, g, now_iso) for n, o, g in reports])
 
-        bump_version(conn, catalog_id)
-        conn.commit()
+        # 写事务：立即取写锁，让并发首次加载排队而不是各自创建目录。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM catalogs WHERE is_demo = 1 ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO catalogs(name, version, is_demo, created_at)"
+                    " VALUES (?, 0, 1, ?)", ("演示目录", now_iso))
+                catalog_id = cur.lastrowid
+                created = True
+            else:
+                catalog_id = row["id"]
+                created = False
+                # 兼容展示名称，但绝不按名称匹配（同名普通目录不受影响）。
+                conn.execute(
+                    "UPDATE catalogs SET name = ? WHERE id = ? AND name != ?",
+                    ("演示目录", catalog_id, "演示目录"))
+
+            conn.execute("DELETE FROM partitions WHERE catalog_id = ?", (catalog_id,))
+            conn.execute("DELETE FROM reports WHERE catalog_id = ?", (catalog_id,))
+            conn.executemany(
+                "INSERT INTO partitions(catalog_id, partition_hour, planned_deadline,"
+                " submitted_at, revision, created_at) VALUES (?,?,?,?,?,?)",
+                [(catalog_id, *r) for r in rows])
+            conn.executemany(
+                "INSERT INTO reports(catalog_id, name, offset_days, grace_minutes, created_at)"
+                " VALUES (?,?,?,?,?)",
+                [(catalog_id, n, o, g, now_iso) for n, o, g in reports])
+            bump_version(conn, catalog_id)
+            version = current_version(conn, catalog_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
         as_of = datetime(today.year, today.month, today.day, 6, tzinfo=logic.UTC)
-        return {"catalog_id": catalog_id, "business_date": today.isoformat(),
-                "as_of": logic.iso(as_of),
-                "catalog_version": current_version(conn, catalog_id)}
+        return {"catalog_id": catalog_id, "is_demo": True, "created": created,
+                "name": "演示目录", "business_date": today.isoformat(),
+                "as_of": logic.iso(as_of), "catalog_version": version}
 
     return app
 
